@@ -1,0 +1,4 @@
+# Installed on app01 with: crontab -u www-data ops/crontab.txt
+MAILTO=ops@acme.example
+15 2 * * * php /var/www/invoicing/cron/send_overdue_reminders.php >> /var/log/invoicing/overdue.log 2>&1
+0 3 * * 0 mysqldump -h db01.internal.example invoicing | gzip > /backups/invoicing-weekly.sql.gz

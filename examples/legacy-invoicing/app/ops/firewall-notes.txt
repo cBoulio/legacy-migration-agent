@@ -1,0 +1,7 @@
+Inbound allowlist for app01 (port 443):
+- 10.20.0.15   accounting ERP, polls /status.json every 15 min
+- 10.20.0.0/24 office staff
+
+Outbound:
+- soap.paygate.example:443 (payments)
+- smtp.mail.example:587 (mail)

@@ -1,0 +1,30 @@
+-- MySQL 5.1, MyISAM, latin1. Dumped 2013-04-02.
+CREATE TABLE users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  password_md5 CHAR(32) NOT NULL
+) ENGINE=MyISAM DEFAULT CHARSET=latin1;
+
+CREATE TABLE customers (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  email VARCHAR(255) NOT NULL
+) ENGINE=MyISAM DEFAULT CHARSET=latin1;
+
+CREATE TABLE invoices (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  customer_id INT NOT NULL,
+  number VARCHAR(32) NOT NULL,
+  total_cents INT NOT NULL,
+  status ENUM('open','paid','void') NOT NULL DEFAULT 'open',
+  due_date DATE NOT NULL,
+  updated_at DATETIME
+) ENGINE=MyISAM DEFAULT CHARSET=latin1;
+
+CREATE TABLE payments (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  invoice_id INT NOT NULL,
+  amount_cents INT NOT NULL,
+  gateway_txn_id VARCHAR(64),
+  created_at DATETIME
+) ENGINE=MyISAM DEFAULT CHARSET=latin1;

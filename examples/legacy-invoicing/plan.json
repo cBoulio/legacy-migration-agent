@@ -1,0 +1,1608 @@
+{
+  "summary": "This is an internal PHP 5 / MySQL 5.1 invoicing app (MyISAM, latin1). Staff log in, list invoices and charge cards through a SOAP payment gateway. An accounting ERP polls a JSON status feed at /status.json. A nightly cron job adds a late fee and emails each overdue customer with a PDF attached. The app becomes one Cloudflare Worker (TypeScript with nodejs_compat) using Postgres through Hyperdrive, R2 for PDFs, Cron Triggers plus Queues for the reminder job, Cloudflare Access for staff and ERP authentication, and Wrangler secrets. The main risks:\n- The late-fee job is not idempotent and compounds every night, so it must never run in both systems on the same business day.\n- The charge endpoint has no auth, no double-charge guard and no transaction.\n- An unknown system outside this repo creates invoices, customers and users, and must be found and pointed at Postgres before cut-over.",
+  "sourceStack": "PHP 5.x (ext/mysql, ext/soap, sessions stored in local files) on Apache with mod_rewrite (.htaccess) on host app01. MySQL 5.1 MyISAM/latin1 on db01.internal.example. PHPMailer 5.2.9 over SMTP. Native PHP SoapClient for the PayGate gateway. PDFs on local disk at /var/www/invoicing/storage/pdf. jQuery 1.7.2 frontend. System crontab for the www-data user. Inbound access is controlled by a firewall IP allowlist.",
+  "targetStack": "Cloudflare Workers with nodejs_compat. Workers is not a full Node 22 runtime, so code is written in TypeScript and built and tested with Node 22 tooling. Components:\n- Postgres (managed), reached through Hyperdrive with the `pg` driver.\n- R2 for invoice PDFs.\n- Cron Triggers plus Cloudflare Queues for the overdue-reminder job.\n- Workers TCP `connect()` to SMTP on port 587, or a transactional email API.\n- SOAP envelopes built by hand and sent with `fetch` to PayGate.\n- Cloudflare Access for staff SSO, and an Access service token or WAF IP rule for the ERP.\n- Wrangler secrets for credentials.\n- Postgres point-in-time recovery (PITR) for backups.\n- Workers Logs / Tail with alerting.",
+  "inventory": {
+    "components": [
+      {
+        "name": "Staff invoice list page",
+        "kind": "web-ui",
+        "description": "Requires a PHP session (redirects to /login.php if there is none). Lists the 100 invoices with the latest due dates and a 'Charge card' button on each row. DB values are echoed without escaping (XSS). Also served at /invoices through a rewrite rule.",
+        "evidence": [
+          {
+            "path": "public/index.php",
+            "line": 4,
+            "note": "session check"
+          },
+          {
+            "path": "public/index.php",
+            "line": 8,
+            "note": "invoice query"
+          },
+          {
+            "path": "public/index.php",
+            "line": 20,
+            "note": "unescaped echo"
+          },
+          {
+            "path": "public/.htaccess",
+            "line": 2,
+            "note": "/invoices rewrite"
+          }
+        ]
+      },
+      {
+        "name": "Login page",
+        "kind": "web-ui",
+        "description": "Form POST of email and password. Compares an unsalted MD5 hash with users.password_md5 and sets $_SESSION['user_id']. The session id is not regenerated after login, and there is no logout or CSRF protection. Sessions are stored as files on app01.",
+        "evidence": [
+          {
+            "path": "public/login.php",
+            "line": 8,
+            "note": "MD5 compare"
+          },
+          {
+            "path": "public/login.php",
+            "line": 9,
+            "note": "session set, no regenerate"
+          }
+        ]
+      },
+      {
+        "name": "Charge card API (/api/charge.php)",
+        "kind": "http-api",
+        "description": "POST with invoice_id and card_token. Calls PayGate Charge, inserts a payments row and sets status='paid' without touching updated_at. Returns {ok:true, txn}. Problems:\n- No auth check after session_start.\n- No check that the invoice is still open.\n- No idempotency.\n- SOAP exceptions are not caught.\n- DB errors are only logged.",
+        "evidence": [
+          {
+            "path": "public/api/charge.php",
+            "line": 5,
+            "note": "session_start but no user check"
+          },
+          {
+            "path": "public/api/charge.php",
+            "line": 9,
+            "note": "no status check"
+          },
+          {
+            "path": "public/api/charge.php",
+            "line": 11,
+            "note": "gateway charge"
+          },
+          {
+            "path": "public/api/charge.php",
+            "line": 12,
+            "note": "payment insert"
+          },
+          {
+            "path": "public/api/charge.php",
+            "line": 13,
+            "note": "status update without updated_at"
+          },
+          {
+            "path": "public/api/charge.php",
+            "line": 14,
+            "note": "response shape"
+          }
+        ]
+      },
+      {
+        "name": "Staff UI script",
+        "kind": "web-ui",
+        "description": "jQuery 1.7 delegate handler. Asks for the card token with prompt(), POSTs to /api/charge.php, and marks the row paid on any 2xx response without reading the body.",
+        "evidence": [
+          {
+            "path": "public/js/invoices.js",
+            "line": 5
+          },
+          {
+            "path": "public/js/invoices.js",
+            "line": 7
+          },
+          {
+            "path": "public/js/invoices.js",
+            "line": 10,
+            "note": "marks paid on any 2xx"
+          }
+        ]
+      },
+      {
+        "name": "Invoice status feed (/status.json)",
+        "kind": "http-api",
+        "description": "GET ?since=. Returns a JSON array of {number, status, total_cents, updated_at} for rows with updated_at >= since. No app-level auth; it is protected only by the IP allowlist. Polled by the accounting ERP.",
+        "evidence": [
+          {
+            "path": "public/api/invoice_status.php",
+            "line": 2,
+            "note": "ERP polls every 15 min"
+          },
+          {
+            "path": "public/api/invoice_status.php",
+            "line": 3,
+            "note": "no auth, IP allowlist only"
+          },
+          {
+            "path": "public/api/invoice_status.php",
+            "line": 8,
+            "note": "query"
+          },
+          {
+            "path": "public/.htaccess",
+            "line": 3,
+            "note": "/status.json rewrite"
+          }
+        ]
+      },
+      {
+        "name": "Overdue reminder job",
+        "kind": "scheduled-job",
+        "description": "Runs daily at 02:15 as www-data. For every open invoice with due_date before today, adds LATE_FEE_PERCENT of the current total and emails the customer with <number>.pdf attached. It is not idempotent, and because the selection never changes, the fee compounds every night. The return value of send_mail is ignored.",
+        "evidence": [
+          {
+            "path": "ops/crontab.txt",
+            "line": 3,
+            "note": "15 2 * * *"
+          },
+          {
+            "path": "cron/send_overdue_reminders.php",
+            "line": 3,
+            "note": "not idempotent"
+          },
+          {
+            "path": "cron/send_overdue_reminders.php",
+            "line": 11,
+            "note": "fee update"
+          },
+          {
+            "path": "cron/send_overdue_reminders.php",
+            "line": 13,
+            "note": "email"
+          },
+          {
+            "path": "includes/db.php",
+            "line": 24,
+            "note": "selection open & due_date < CURDATE()"
+          }
+        ]
+      },
+      {
+        "name": "Weekly MySQL backup",
+        "kind": "scheduled-job",
+        "description": "Sunday 03:00 mysqldump piped through gzip into one file that is overwritten each week. Errors are mailed to ops via MAILTO.",
+        "evidence": [
+          {
+            "path": "ops/crontab.txt",
+            "line": 4
+          },
+          {
+            "path": "ops/crontab.txt",
+            "line": 2,
+            "note": "MAILTO"
+          }
+        ]
+      },
+      {
+        "name": "DB access layer",
+        "kind": "library",
+        "description": "ext/mysql connection forced to latin1. Builds SQL strings and logs errors without raising them.",
+        "evidence": [
+          {
+            "path": "includes/db.php",
+            "line": 7
+          },
+          {
+            "path": "includes/db.php",
+            "line": 9,
+            "note": "latin1"
+          },
+          {
+            "path": "includes/db.php",
+            "line": 17,
+            "note": "errors only logged"
+          }
+        ]
+      },
+      {
+        "name": "PaymentGateway",
+        "kind": "library",
+        "description": "Native SoapClient with exceptions enabled. Charge sends {MerchantId, ApiKey, Reference 'INV-<id>', Amount, Token}. Refund exists but nothing calls it.",
+        "evidence": [
+          {
+            "path": "includes/PaymentGateway.php",
+            "line": 8
+          },
+          {
+            "path": "includes/PaymentGateway.php",
+            "line": 15,
+            "note": "Reference INV-id"
+          },
+          {
+            "path": "includes/PaymentGateway.php",
+            "line": 21,
+            "note": "unused refund"
+          }
+        ]
+      },
+      {
+        "name": "Mailer",
+        "kind": "library",
+        "description": "PHPMailer over SMTP with auth. Sends from billing@acme.example. No Port or SMTPSecure is set. Requires vendor/, which is not in the repo.",
+        "evidence": [
+          {
+            "path": "includes/Mailer.php",
+            "line": 3,
+            "note": "vendor autoload"
+          },
+          {
+            "path": "includes/Mailer.php",
+            "line": 8
+          },
+          {
+            "path": "includes/Mailer.php",
+            "line": 12
+          }
+        ]
+      },
+      {
+        "name": "Configuration",
+        "kind": "config",
+        "description": "Hard-coded config constants: DB_HOST, DB_NAME, DB_USER, DB_PASS, SMTP_HOST, SMTP_USER, SMTP_PASS, PAYGATE_WSDL, PAYGATE_MERCHANT_ID, PAYGATE_API_KEY, LATE_FEE_PERCENT, PDF_DIR. The secrets are stored as literals in a file committed to the repo.",
+        "evidence": [
+          {
+            "path": "includes/config.php",
+            "line": 2
+          },
+          {
+            "path": "includes/config.php",
+            "line": 6,
+            "note": "DB_PASS"
+          },
+          {
+            "path": "includes/config.php",
+            "line": 10,
+            "note": "SMTP_PASS"
+          },
+          {
+            "path": "includes/config.php",
+            "line": 14,
+            "note": "PAYGATE_API_KEY"
+          },
+          {
+            "path": "includes/config.php",
+            "line": 16,
+            "note": "LATE_FEE_PERCENT"
+          }
+        ]
+      },
+      {
+        "name": "MySQL database 'invoicing'",
+        "kind": "database",
+        "description": "Tables users, customers, invoices and payments, all MyISAM/latin1 with no foreign keys. A 2015 migration adds invoices.tax_cents and a tax_rates table, which no code uses.",
+        "evidence": [
+          {
+            "path": "sql/schema.sql",
+            "line": 1
+          },
+          {
+            "path": "sql/schema.sql",
+            "line": 14
+          },
+          {
+            "path": "sql/schema.sql",
+            "line": 24
+          },
+          {
+            "path": "sql/migrations/2015_add_tax.sql",
+            "line": 1
+          },
+          {
+            "path": "sql/migrations/2015_add_tax.sql",
+            "line": 3
+          }
+        ]
+      },
+      {
+        "name": "Invoice PDF directory",
+        "kind": "file-storage",
+        "description": "/var/www/invoicing/storage/pdf, read by the reminder job. Nothing in the repo writes to it.",
+        "evidence": [
+          {
+            "path": "includes/config.php",
+            "line": 17
+          },
+          {
+            "path": "cron/send_overdue_reminders.php",
+            "line": 12
+          }
+        ]
+      }
+    ],
+    "dependencies": [
+      {
+        "name": "php",
+        "version": ">=5.4",
+        "status": "replace",
+        "reason": "Code depends on ext/mysql, which only runs on PHP 5. Replaced by TypeScript on Workers.",
+        "evidence": [
+          {
+            "path": "composer.json",
+            "line": 5
+          },
+          {
+            "path": "includes/db.php",
+            "line": 7
+          }
+        ]
+      },
+      {
+        "name": "phpmailer/phpmailer",
+        "version": "5.2.9",
+        "status": "replace",
+        "reason": "Old PHPMailer version. Replace with Workers TCP connect() SMTP or an email API.",
+        "evidence": [
+          {
+            "path": "composer.json",
+            "line": 6
+          },
+          {
+            "path": "includes/Mailer.php",
+            "line": 6
+          }
+        ]
+      },
+      {
+        "name": "econea/nusoap",
+        "version": "0.9.6",
+        "status": "remove",
+        "reason": "Declared but unused; the code uses ext/soap SoapClient. The SOAP envelope will be built by hand and sent with fetch.",
+        "evidence": [
+          {
+            "path": "composer.json",
+            "line": 7
+          },
+          {
+            "path": "includes/PaymentGateway.php",
+            "line": 8
+          }
+        ]
+      },
+      {
+        "name": "tecnickcom/tcpdf",
+        "version": "6.2.12",
+        "status": "remove",
+        "reason": "Declared but never used. Nothing in the repo generates PDFs.",
+        "evidence": [
+          {
+            "path": "composer.json",
+            "line": 8
+          }
+        ]
+      },
+      {
+        "name": "jquery",
+        "version": "1.7.2",
+        "status": "replace",
+        "reason": "End-of-life, and the file is missing from the repo. Replace with plain fetch.",
+        "evidence": [
+          {
+            "path": "public/index.php",
+            "line": 13
+          },
+          {
+            "path": "public/js/invoices.js",
+            "line": 3
+          }
+        ]
+      },
+      {
+        "name": "ext/mysql",
+        "version": "PHP 5 built-in",
+        "status": "replace",
+        "reason": "Removed in PHP 7. Replace with pg through Hyperdrive using parameterised queries.",
+        "evidence": [
+          {
+            "path": "includes/db.php",
+            "line": 7
+          }
+        ]
+      },
+      {
+        "name": "ext/soap (SoapClient)",
+        "version": "PHP built-in (not declared)",
+        "status": "replace",
+        "reason": "Not available on Workers. Replace with a hand-built SOAP envelope sent with fetch.",
+        "evidence": [
+          {
+            "path": "includes/PaymentGateway.php",
+            "line": 8
+          }
+        ]
+      }
+    ]
+  },
+  "integrations": [
+    {
+      "name": "Staff browsers (office subnet)",
+      "direction": "inbound",
+      "protocol": "HTTPS HTML + form POST + AJAX",
+      "description": "Office staff on 10.20.0.0/24 use /index.php, /invoices, /login.php and /api/charge.php. Sessions are stored as files on app01.",
+      "migrationAction": "Put Cloudflare Access (SSO) in front of the Worker and keep the old paths as aliases. Use the Access identity or a KV/signed-cookie session. Tell staff they will be logged out at cut-over.",
+      "evidence": [
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 3
+        },
+        {
+          "path": "public/index.php",
+          "line": 3
+        },
+        {
+          "path": "public/js/invoices.js",
+          "line": 7
+        }
+      ]
+    },
+    {
+      "name": "Accounting ERP status poll",
+      "direction": "inbound",
+      "protocol": "HTTPS JSON (GET /status.json?since=)",
+      "description": "The ERP at 10.20.0.15 polls every 15 minutes. It depends on:\n- The exact path.\n- A JSON array of {number, status, total_cents, updated_at}. ext/mysql returns every value as a string, and updated_at uses the MySQL 'YYYY-MM-DD HH:MM:SS' format.\n- IP allowlisting instead of auth.\n\nRows with a NULL updated_at are never returned. Because charge.php does not set updated_at, the ERP never sees invoices become paid. This consumer appears only in a code comment and the firewall notes.",
+      "migrationAction": "Keep the /status.json and /api/invoice_status.php paths with byte-compatible output: string types, the same timestamp format, and the same handling of an empty since. Protect them with an Access service token or a WAF rule on the ERP's egress IP. Write a contract test from captured production responses. Agree the ERP URL or DNS switch and the paid-status behaviour change with accounting.",
+      "evidence": [
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 2
+        },
+        {
+          "path": "public/api/invoice_status.php",
+          "line": 2
+        },
+        {
+          "path": "public/api/invoice_status.php",
+          "line": 8
+        },
+        {
+          "path": "public/.htaccess",
+          "line": 3
+        },
+        {
+          "path": "sql/schema.sql",
+          "line": 21
+        }
+      ]
+    },
+    {
+      "name": "System cron (www-data on app01)",
+      "direction": "inbound",
+      "protocol": "crontab / php CLI",
+      "description": "Triggers the overdue reminder job daily at 02:15 server local time, and the weekly mysqldump.",
+      "migrationAction": "Replace with a Cron Trigger that queues one message per invoice and is guarded by a late_fee_runs ledger. Replace the backup with Postgres PITR. Remove the crontab line before enabling the trigger.",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 1
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 3
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 4
+        }
+      ]
+    },
+    {
+      "name": "Unknown writer of invoices/customers/users",
+      "direction": "inbound",
+      "protocol": "Unknown (probably direct SQL to db01)",
+      "description": "No code in the repo inserts invoices, customers or users. Something outside the app creates them, most likely by writing straight to MySQL.",
+      "migrationAction": "Identify it before P3. It must be pointed at Postgres, or at a new Worker API, at cut-over. This is a go/no-go gate.",
+      "evidence": [
+        {
+          "path": "sql/schema.sql",
+          "line": 14
+        },
+        {
+          "path": "includes/db.php",
+          "line": 23
+        }
+      ]
+    },
+    {
+      "name": "PayGate SOAP payment service",
+      "direction": "outbound",
+      "protocol": "SOAP over HTTPS (443)",
+      "description": "The Charge operation is called with MerchantId, ApiKey, Reference 'INV-<invoice id>', Amount and Token. Only TransactionId is read from the result. The firewall allows egress to soap.paygate.example:443.",
+      "migrationAction": "Build the Charge envelope by hand from the WSDL and send it with fetch. Store the merchant ID and API key as Wrangler secrets. Keep invoice ids unchanged so the Reference values stay the same. Find out whether PayGate allowlists source IPs, since Workers egress IPs are not fixed, and whether it de-duplicates on Reference.",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 12
+        },
+        {
+          "path": "includes/PaymentGateway.php",
+          "line": 12
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 6
+        }
+      ]
+    },
+    {
+      "name": "SMTP mail relay",
+      "direction": "outbound",
+      "protocol": "SMTP (firewall allows 587)",
+      "description": "The reminder job sends mail from billing@acme.example to customers.email with the invoice PDF attached. The code does not set a port, although the firewall only allows 587.",
+      "migrationAction": "Use Workers TCP connect() with STARTTLS on 587, or an email API. Confirm the live port. Keep the sender address and confirm SPF/DKIM for the new sending path.",
+      "evidence": [
+        {
+          "path": "includes/Mailer.php",
+          "line": 8
+        },
+        {
+          "path": "includes/Mailer.php",
+          "line": 12
+        },
+        {
+          "path": "includes/config.php",
+          "line": 8
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 7
+        }
+      ]
+    },
+    {
+      "name": "MySQL db01",
+      "direction": "outbound",
+      "protocol": "MySQL protocol",
+      "description": "The app's only database, also read by the backup cron.",
+      "migrationAction": "Migrate to Postgres through Hyperdrive. During the parallel run, export from a snapshot or replica to avoid locking production.",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 3
+        },
+        {
+          "path": "includes/db.php",
+          "line": 7
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 4
+        }
+      ]
+    },
+    {
+      "name": "Local PDF storage",
+      "direction": "outbound",
+      "protocol": "Local filesystem",
+      "description": "The reminder job attaches PDF_DIR/<number>.pdf. The process that writes these files is unknown.",
+      "migrationAction": "Copy the files to R2, keyed by invoice id with the number kept as metadata. Whatever generates the PDFs must write to R2 after cut-over.",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 17
+        },
+        {
+          "path": "cron/send_overdue_reminders.php",
+          "line": 12
+        }
+      ]
+    },
+    {
+      "name": "Ops error mail (cron MAILTO)",
+      "direction": "outbound",
+      "protocol": "SMTP (cron MAILTO)",
+      "description": "Cron output that is not redirected, which here is the mysqldump stderr, is mailed to ops@acme.example.",
+      "migrationAction": "Replace with Workers Logs/Tail alerts for failed Cron Trigger and Queue runs before P3.",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 2
+        }
+      ]
+    }
+  ],
+  "dataMigration": [
+    {
+      "order": 1,
+      "title": "Profile the source database",
+      "description": "Work from a snapshot or replica, not live MyISAM. Steps:\n- Run SHOW CREATE TABLE to confirm the 2015 migration (tax_cents, tax_rates) was applied.\n- Record row counts per table.\n- Find zero or invalid dates, rows with NULL updated_at, and duplicate invoices.number values.\n- Find duplicate payments rows per invoice_id, which can exist because charge.php has no guard.\n- Find orphan invoices and payments (there are no foreign keys).\n- Find non-ASCII bytes, and UTF-8 sequences stored in latin1 columns (double encoding).\n- Measure the PDF file count and total size.",
+      "tables": [
+        "users",
+        "customers",
+        "invoices",
+        "payments",
+        "tax_rates"
+      ],
+      "verification": "A signed-off profile report with counts for each anomaly class, and a decision recorded for each one: keep, fix or quarantine.",
+      "evidence": [
+        {
+          "path": "sql/schema.sql",
+          "line": 1
+        },
+        {
+          "path": "sql/schema.sql",
+          "line": 17,
+          "note": "number not unique"
+        },
+        {
+          "path": "sql/schema.sql",
+          "line": 21,
+          "note": "nullable updated_at"
+        },
+        {
+          "path": "sql/migrations/2015_add_tax.sql",
+          "line": 1
+        },
+        {
+          "path": "public/api/charge.php",
+          "line": 12
+        }
+      ]
+    },
+    {
+      "order": 2,
+      "title": "Create the Postgres schema",
+      "description": "Use identity columns that keep the source ids, because the PayGate Reference uses the invoice id. Other changes:\n- invoices.status as text with CHECK ('open','paid','void').\n- DATETIME becomes timestamp, interpreted in the documented server time zone.\n- payments gets new nullable columns status and idempotency_key, with a unique index on idempotency_key only. Existing duplicate rows stay as they are.\n- New table late_fee_runs(invoice_id, business_date) with a unique constraint.\n- Foreign keys are added after orphans are resolved.",
+      "tables": [
+        "users",
+        "customers",
+        "invoices",
+        "payments",
+        "tax_rates",
+        "late_fee_runs"
+      ],
+      "verification": "Run the schema diff against the mapping document. Apply the migration from scratch in CI.",
+      "evidence": [
+        {
+          "path": "sql/schema.sql",
+          "line": 19,
+          "note": "ENUM status"
+        },
+        {
+          "path": "sql/schema.sql",
+          "line": 24
+        },
+        {
+          "path": "includes/PaymentGateway.php",
+          "line": 15
+        }
+      ]
+    },
+    {
+      "order": 3,
+      "title": "Rehearsal bulk load",
+      "description": "Export from a snapshot or replica. Running mysqldump --lock-tables on live MyISAM would block charges and the cron, so if a live dump is unavoidable, run it outside business hours and away from 02:15 Mon–Sun and 03:00 Sunday. Convert the text as Windows-1252 to UTF-8 and fix any double-encoded rows found in profiling. Load the data, then reset the sequences to MAX(id)+1. Repeat at least twice and record the duration to size the cut-over window.",
+      "tables": [
+        "users",
+        "customers",
+        "invoices",
+        "payments",
+        "tax_rates"
+      ],
+      "verification": "For each table, compare:\n- Row counts.\n- SUM(total_cents), SUM(tax_cents) and SUM(amount_cents).\n- An MD5 of the ordered id list.\n- A per-row hash of normalised columns.\n- A random 1% sample compared field by field.\nZero differences are required.",
+      "evidence": [
+        {
+          "path": "includes/db.php",
+          "line": 9,
+          "note": "latin1 connection"
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 3
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 4
+        }
+      ]
+    },
+    {
+      "order": 4,
+      "title": "Copy PDFs to R2",
+      "description": "Copy every file in PDF_DIR to R2. Use a key based on the invoice id, looked up by number, with the original file name and number kept as metadata. List PDFs that match no invoice, or more than one, for review.",
+      "tables": [],
+      "verification": "The file count matches, the SHA-256 of every object matches the source, and the list of unmapped or ambiguous files has been reviewed.",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 17
+        },
+        {
+          "path": "cron/send_overdue_reminders.php",
+          "line": 12
+        }
+      ]
+    },
+    {
+      "order": 5,
+      "title": "Carry over password hashes",
+      "description": "Copy password_md5 unchanged. The new login checks the MD5 hash, then immediately rehashes with argon2id or bcrypt and clears the MD5 value. If Cloudflare Access SSO replaces passwords, keep the users table only to map staff identities.",
+      "tables": [
+        "users"
+      ],
+      "verification": "Test accounts can log in on the new system. Count users still holding an MD5 hash over time.",
+      "evidence": [
+        {
+          "path": "public/login.php",
+          "line": 8
+        },
+        {
+          "path": "sql/schema.sql",
+          "line": 5
+        }
+      ]
+    },
+    {
+      "order": 6,
+      "title": "Final load at cut-over and seeding the fee ledger",
+      "description": "During the P3 write freeze:\n- The old charge endpoint returns 503.\n- Crontab line 3 is removed.\n- The unknown writer is paused.\n\nThen run a full reload (MyISAM has no change tracking). Seed late_fee_runs for every currently overdue open invoice with the business date of the last old run, so the new trigger cannot apply a second fee that day.",
+      "tables": [
+        "users",
+        "customers",
+        "invoices",
+        "payments",
+        "tax_rates",
+        "late_fee_runs"
+      ],
+      "verification": "Repeat every check from step 3. Diff /status.json from old and new for several since values: epoch, empty, and the last 24 hours. Confirm the seeded late_fee_runs count equals the count of overdue open invoices.",
+      "evidence": [
+        {
+          "path": "includes/db.php",
+          "line": 24
+        },
+        {
+          "path": "public/api/invoice_status.php",
+          "line": 8
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 3
+        }
+      ]
+    },
+    {
+      "order": 7,
+      "title": "Final archive of the old system",
+      "description": "After P4 ends, take a final mysqldump plus a tarball of the PDFs and store them in cold storage with checksums and a retention period agreed with finance.",
+      "tables": [
+        "users",
+        "customers",
+        "invoices",
+        "payments",
+        "tax_rates"
+      ],
+      "verification": "Restore the archive into a scratch MySQL and confirm the row counts and sums match the step 6 numbers. Recheck the archive checksums.",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 4
+        },
+        {
+          "path": "includes/config.php",
+          "line": 17
+        }
+      ]
+    }
+  ],
+  "phases": [
+    {
+      "id": "P0",
+      "name": "Preparation and secrets",
+      "goal": "Provision the target platform, move secrets out of source, answer the gating questions, and put backups and alerting in place.",
+      "steps": [
+        "Provision Postgres with PITR enabled and run a restore test. Provision Hyperdrive, R2, Queues, Cloudflare Access and Workers Logs alerting.",
+        "Create new credentials alongside the old ones: a new MySQL user for the export, a second PayGate key if PayGate supports two at once, and new SMTP credentials. Store them as Wrangler secrets. Leave the app01 credentials untouched for now.",
+        "Treat DB_PASS, SMTP_PASS and PAYGATE_API_KEY as exposed because they are in the repo. Plan their rotation and add secret scanning.",
+        "Capture production samples of /status.json responses and the PHP error log. Before the parallel run, add a fee log to the PHP job: log invoice_id, the fee and send_mail's return value.",
+        "Resolve the gating open questions: who the unknown writer is, how the ERP is reached and authenticated, PayGate source-IP allowlisting, SMTP port, server time zone, and whether the compounding fee is intended."
+      ],
+      "exitCriteria": [
+        "The PITR restore test passed.",
+        "The unknown invoice/customer/user writer is identified, with a plan to repoint it.",
+        "The ERP owner has agreed the access method and URL.",
+        "Alerting fires on a test failure."
+      ],
+      "rollback": "Production behaviour is unchanged except for the added logging in the PHP job. Revert that change from version control. Revoke any new credentials; the old ones stay valid throughout P0.",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 2
+        },
+        {
+          "path": "includes/config.php",
+          "line": 6
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 2
+        },
+        {
+          "path": "cron/send_overdue_reminders.php",
+          "line": 13
+        }
+      ]
+    },
+    {
+      "id": "P1",
+      "name": "Build and rehearse",
+      "goal": "Build the Worker with route and contract parity plus safety fixes, and rehearse the data load.",
+      "steps": [
+        "Routes: /, /index.php, /invoices, /login.php, /api/charge.php, /status.json and /api/invoice_status.php. Escape all output.",
+        "Charge flow:\n- Require an authenticated staff user.\n- Require status='open'.\n- Insert a pending payment row with an idempotency key before calling PayGate.\n- Set updated_at when marking the invoice paid.\n- Return a non-2xx response on any failure (invoices.js treats every 2xx as paid).\n- Add a reconciliation job that checks PayGate by Reference INV-<id>.",
+        "Reminder job: a Cron Trigger at the UTC equivalent of 02:15 in the business time zone puts one Queue message per invoice. The consumer inserts into late_fee_runs (unique on invoice_id and business_date) in the same transaction as the fee update, and records the email send separately. An env flag REMINDER_MODE=off|dryrun|live defaults to off.",
+        "Contract tests for /status.json: string field types, timestamp format, NULL updated_at, and empty or malformed since.",
+        "Write and rehearse the reverse-sync script (Postgres to MySQL) for invoices and payments changed after cut-over.",
+        "Run data migration steps 1–5 against a snapshot at least twice."
+      ],
+      "exitCriteria": [
+        "Contract tests pass against the captured production responses.",
+        "The rehearsal loads verify with zero differences.",
+        "The reverse sync has been rehearsed into a scratch MySQL.",
+        "A security review of the charge flow is done."
+      ],
+      "rollback": "Nothing in production depends on the new environment. Discard or redeploy it.",
+      "evidence": [
+        {
+          "path": "public/api/charge.php",
+          "line": 13
+        },
+        {
+          "path": "public/js/invoices.js",
+          "line": 10
+        },
+        {
+          "path": "public/api/invoice_status.php",
+          "line": 8
+        },
+        {
+          "path": "includes/db.php",
+          "line": 24
+        }
+      ]
+    },
+    {
+      "id": "P2",
+      "name": "Parallel run (shadow, read-only)",
+      "goal": "Prove the new system matches the old one while MySQL and the PHP app remain authoritative.",
+      "steps": [
+        "Refresh Postgres from a MySQL snapshot or replica each day after the 02:15 job finishes.",
+        "Run the new Worker behind Access for a pilot group in read-only mode, with charge disabled.",
+        "Run REMINDER_MODE=dryrun: compute the fee list without any UPDATE, and send mail only to an internal test mailbox.",
+        "Each day, compare the dry-run fee list with the new PHP fee log and with the before/after difference in invoices.total_cents around 02:15.",
+        "Each day, diff /status.json responses from old and new for the same since values."
+      ],
+      "exitCriteria": [
+        "At least 10 consecutive business days with zero unexplained differences in the fee list and the status feed.",
+        "Pilot staff sign-off.",
+        "The dry-run job completes within Worker and Queue limits at the observed volume."
+      ],
+      "rollback": "Disable the Worker route or the Access application. The old system was never changed.",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 3
+        },
+        {
+          "path": "cron/send_overdue_reminders.php",
+          "line": 11
+        },
+        {
+          "path": "public/api/invoice_status.php",
+          "line": 13
+        }
+      ]
+    },
+    {
+      "id": "P3",
+      "name": "Cut-over (traffic switch)",
+      "goal": "Make the Worker and Postgres authoritative without a double fee or a lost payment.",
+      "steps": [
+        "Precondition: the unknown writer is ready to be repointed.",
+        "Start the window after the 02:15 run has finished and logged. Remove crontab line 3 on app01 and confirm with crontab -l.",
+        "Make the old charge.php return 503 and pause the unknown writer.",
+        "Run data migration step 6, including seeding the late_fee_runs ledger, and verify it.",
+        "Repoint the unknown writer. Switch DNS or routes for the staff hostname and the ERP path. Confirm the ERP's first successful poll in the Worker logs.",
+        "Set REMINDER_MODE=live only after confirming crontab line 3 is gone. The ledger blocks any second fee on the same business day."
+      ],
+      "exitCriteria": [
+        "Verification checks pass.",
+        "The ERP polls successfully for 24 hours.",
+        "The first live reminder run applies fees only to invoices that have no ledger row for that business date.",
+        "No charge errors in reconciliation."
+      ],
+      "rollback": "1. Set REMINDER_MODE=off.\n2. Run the reverse sync for invoices and payments changed in Postgres, together with any invoices created by the repointed writer.\n3. Point DNS and routes back to app01 and remove the 503 from charge.php.\n4. Point the writer back at MySQL.\n5. Restore crontab line 3 only from the next business day if the new job already ran that day.",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 3
+        },
+        {
+          "path": "public/api/charge.php",
+          "line": 1
+        },
+        {
+          "path": "public/.htaccess",
+          "line": 3
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 2
+        }
+      ]
+    },
+    {
+      "id": "P4",
+      "name": "Old system read-only (2–4 weeks)",
+      "goal": "Keep the old system available for reference and rollback while preventing any writes to it.",
+      "steps": [
+        "Set read_only on db01 and revoke write grants from invoicing_app. Keep the reverse-sync user's grants documented, but disabled.",
+        "Leave app01 serving reads only on an internal hostname, or stop Apache. Keep the crontab empty.",
+        "Watch the app01 access logs for any remaining callers, especially 10.20.0.15."
+      ],
+      "exitCriteria": [
+        "Zero inbound requests to app01 for 2 weeks.",
+        "Finance has signed off on reconciliation between PayGate and the Postgres payments table."
+      ],
+      "rollback": "Lift read_only, restore the invoicing_app and reverse-sync grants, then follow the P3 rollback (reminder off, reverse sync, DNS back, crontab from the next business day).",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 5
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 1
+        }
+      ]
+    },
+    {
+      "id": "P5",
+      "name": "Decommission",
+      "goal": "Archive the old data, rotate credentials, remove network entries and shut down the hosts.",
+      "steps": [
+        "Run the decommission checklist in order."
+      ],
+      "exitCriteria": [
+        "Every checklist item is complete, with evidence attached to the change ticket."
+      ],
+      "rollback": "Up to the host shutdown, restore from the final archive (data step 7). After the shutdown, rebuilding from the archive is the only option, so do not shut down until the P4 exit criteria are met.",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 1
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 1
+        }
+      ]
+    }
+  ],
+  "decommissionChecklist": [
+    {
+      "item": "Confirm 2 weeks with zero inbound traffic in the app01 access logs, including from the ERP at 10.20.0.15 and the office subnet.",
+      "evidence": [
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 2
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 3
+        }
+      ]
+    },
+    {
+      "item": "Remove both crontab entries for www-data on app01 (reminder and mysqldump) and confirm with crontab -l.",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 3
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 4
+        }
+      ]
+    },
+    {
+      "item": "Take the final mysqldump of 'invoicing' and a tarball of /var/www/invoicing/storage/pdf. Record checksums, do a restore test, and store them in cold storage with the agreed retention.",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 4
+        },
+        {
+          "path": "includes/config.php",
+          "line": 17
+        }
+      ]
+    },
+    {
+      "item": "Archive /var/log/invoicing/overdue.log and the old /backups/invoicing-weekly.sql.gz, then delete them from the hosts.",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 3
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 4
+        }
+      ]
+    },
+    {
+      "item": "Drop the invoicing_app MySQL user and any .my.cnf used by the backup job.",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 5
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 4
+        }
+      ]
+    },
+    {
+      "item": "Rotate and revoke the old credentials that were in source: DB_PASS (includes/config.php:6), SMTP_PASS (includes/config.php:10) and PAYGATE_API_KEY (includes/config.php:14). Remove config.php from the repo, or replace it with a template.",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 6
+        },
+        {
+          "path": "includes/config.php",
+          "line": 10
+        },
+        {
+          "path": "includes/config.php",
+          "line": 14
+        }
+      ]
+    },
+    {
+      "item": "Remove the app01 inbound allowlist rules (10.20.0.15, 10.20.0.0/24) and the egress rules to soap.paygate.example:443 and smtp.mail.example:587. Ask PayGate to remove app01's IP from any allowlist they hold.",
+      "evidence": [
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 2
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 6
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 7
+        }
+      ]
+    },
+    {
+      "item": "Remove the DNS records for app01 and the old invoicing hostname. If db01 is not shared, remove db01.internal.example as well.",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 3
+        }
+      ]
+    },
+    {
+      "item": "Shut down and deprovision app01 (/var/www/invoicing) and, if it is not shared with other apps, db01.",
+      "evidence": [
+        {
+          "path": "README.txt",
+          "line": 8
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 1
+        }
+      ]
+    }
+  ],
+  "risks": [
+    {
+      "title": "Late-fee job is not idempotent and compounds",
+      "severity": "critical",
+      "description": "The job selects every open invoice with due_date before today and adds a percentage of the current total. Running it does not change the selection, so the fee compounds nightly and any double run doubles fees. If the old cron and the new trigger run on the same business day, for example on the cut-over day or during a rollback, customers are overcharged and emailed twice.",
+      "mitigation": "- Remove the old crontab line before enabling the new trigger, and only enable the trigger behind REMINDER_MODE.\n- Keep a late_fee_runs ledger, unique on invoice_id and business_date, seeded with the last old run date at cut-over.\n- Use the dryrun mode during the parallel run.\n- On rollback, re-enable the crontab only from the next business day.",
+      "evidence": [
+        {
+          "path": "cron/send_overdue_reminders.php",
+          "line": 3
+        },
+        {
+          "path": "cron/send_overdue_reminders.php",
+          "line": 11
+        },
+        {
+          "path": "includes/db.php",
+          "line": 24
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 3
+        }
+      ]
+    },
+    {
+      "title": "Unknown external writer of invoices, customers and users",
+      "severity": "critical",
+      "description": "Nothing in the repo creates invoices, customers or users. If the system that does this keeps writing to MySQL after cut-over, the new data never reaches Postgres. Once MySQL is read-only (P4), those writes fail.",
+      "mitigation": "Identifying the writer and repointing it is a go/no-go gate for P3. Monitor for new rows in MySQL after cut-over.",
+      "evidence": [
+        {
+          "path": "sql/schema.sql",
+          "line": 14
+        },
+        {
+          "path": "includes/db.php",
+          "line": 23
+        }
+      ]
+    },
+    {
+      "title": "Charge can bill a card with no local record, or bill twice",
+      "severity": "high",
+      "description": "The charge endpoint:\n- Has no auth check.\n- Does not check that the invoice is open.\n- Has no idempotency key.\n- Has no transaction (MyISAM).\n- Does not catch SOAP exceptions.\n- Only logs DB errors.\n- Always returns ok:true.\n\nThe UI marks the invoice paid on any 2xx. A timeout or a failed INSERT leaves a charged card with no payment row, and staff then retry.",
+      "mitigation": "New flow: an authenticated user, a status='open' check, a pending payment row with an idempotency key written before the gateway call, a non-2xx response on failure, and a reconciliation job that checks PayGate by Reference. Before cut-over, reconcile historical payments against PayGate.",
+      "evidence": [
+        {
+          "path": "public/api/charge.php",
+          "line": 5
+        },
+        {
+          "path": "public/api/charge.php",
+          "line": 12
+        },
+        {
+          "path": "public/api/charge.php",
+          "line": 14
+        },
+        {
+          "path": "includes/PaymentGateway.php",
+          "line": 8
+        },
+        {
+          "path": "includes/db.php",
+          "line": 17
+        },
+        {
+          "path": "public/js/invoices.js",
+          "line": 10
+        }
+      ]
+    },
+    {
+      "title": "ERP feed contract and access control",
+      "severity": "high",
+      "description": "The ERP depends on the exact path, string-typed JSON fields and the MySQL timestamp format. It is protected only by an IP allowlist, while a Worker is reachable from the internet. Rows with a NULL updated_at never appear in the feed, and a paid status never appears either, because charge.php does not set updated_at. Fixing that changes what the ERP receives.",
+      "mitigation": "- Write a contract test from captured responses.\n- Add Access service-token or WAF IP protection.\n- Agree with accounting before shipping the updated_at fix and any backfill.\n- Cover empty or malformed since values.",
+      "evidence": [
+        {
+          "path": "public/api/invoice_status.php",
+          "line": 3
+        },
+        {
+          "path": "public/api/invoice_status.php",
+          "line": 8
+        },
+        {
+          "path": "public/api/charge.php",
+          "line": 13
+        },
+        {
+          "path": "sql/schema.sql",
+          "line": 21
+        }
+      ]
+    },
+    {
+      "title": "Character set conversion",
+      "severity": "medium",
+      "description": "MySQL 'latin1' is really cp1252, and some UTF-8 may be stored double-encoded. PHP json_encode fails on non-UTF-8 strings, so the current feed may already break on some rows.",
+      "mitigation": "Convert as Windows-1252, detect double encoding during profiling, and check the PHP error log for json_encode failures.",
+      "evidence": [
+        {
+          "path": "includes/db.php",
+          "line": 9
+        },
+        {
+          "path": "public/api/invoice_status.php",
+          "line": 13
+        }
+      ]
+    },
+    {
+      "title": "Time zone shift for the job and dates",
+      "severity": "medium",
+      "description": "The cron runs at 02:15 server local time, and CURDATE()/NOW() use the server time zone. Cron Triggers run in UTC, so the overdue cutoff and the business_date in the ledger can move.",
+      "mitigation": "Confirm the server time zone. Compute business_date explicitly in that zone, and convert DATETIME values using it.",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 3
+        },
+        {
+          "path": "includes/db.php",
+          "line": 24
+        }
+      ]
+    },
+    {
+      "title": "Worker limits on the reminder job",
+      "severity": "medium",
+      "description": "A single invocation that sends SMTP mail with PDF attachments for every overdue invoice can exceed CPU and subrequest limits. Today a failed send is ignored and the fee is still applied.",
+      "mitigation": "Put one Queue message per invoice. Record the fee and the email send separately so retries are safe. Load-test during P2.",
+      "evidence": [
+        {
+          "path": "cron/send_overdue_reminders.php",
+          "line": 11
+        },
+        {
+          "path": "cron/send_overdue_reminders.php",
+          "line": 13
+        }
+      ]
+    },
+    {
+      "title": "Outbound network differences (SMTP port, PayGate allowlist)",
+      "severity": "medium",
+      "description": "The code sets no SMTP port (PHPMailer's default is 25), but the firewall only allows 587. PayGate may allowlist the source IP of app01, while Workers egress IPs are not fixed.",
+      "mitigation": "Confirm the live port and PayGate's IP policy in P0. Use 587 with STARTTLS, or an email API. If PayGate requires fixed IPs, plan dedicated egress.",
+      "evidence": [
+        {
+          "path": "includes/Mailer.php",
+          "line": 8
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 6
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 7
+        }
+      ]
+    },
+    {
+      "title": "PDFs not generated by this app",
+      "severity": "medium",
+      "description": "Nothing writes PDF_DIR and TCPDF is unused. If a file is missing, the email is sent without an attachment. Invoice numbers are not unique, so naming files by number can be ambiguous.",
+      "mitigation": "Identify the PDF generator and repoint it to R2. Key R2 objects by invoice id.",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 17
+        },
+        {
+          "path": "composer.json",
+          "line": 8
+        },
+        {
+          "path": "sql/schema.sql",
+          "line": 17
+        }
+      ]
+    },
+    {
+      "title": "Rehearsal export locks production",
+      "severity": "medium",
+      "description": "mysqldump with table locks on MyISAM blocks the charge endpoint and the fee job while it runs.",
+      "mitigation": "Export from a snapshot or replica. Otherwise run outside business hours and away from 02:15 and the Sunday 03:00 run.",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 3
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 4
+        }
+      ]
+    },
+    {
+      "title": "Credentials exposed in the repository",
+      "severity": "high",
+      "description": "DB_PASS, SMTP_PASS and PAYGATE_API_KEY are literals in a committed file.",
+      "mitigation": "Treat them as compromised. Rotate them during P0–P5, use Wrangler secrets, and add secret scanning. Consider rewriting git history.",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 6
+        },
+        {
+          "path": "includes/config.php",
+          "line": 10
+        },
+        {
+          "path": "includes/config.php",
+          "line": 14
+        }
+      ]
+    },
+    {
+      "title": "Sessions and weak auth",
+      "severity": "medium",
+      "description": "Sessions are files on app01 that cannot move to Workers, so staff are logged out at cut-over. Passwords are unsalted MD5, the session id is not regenerated at login, and the invoice list has XSS.",
+      "mitigation": "Use Access SSO or a KV/signed-cookie session, rehash passwords on login, escape output, and tell staff about the forced re-login.",
+      "evidence": [
+        {
+          "path": "public/login.php",
+          "line": 8
+        },
+        {
+          "path": "public/login.php",
+          "line": 9
+        },
+        {
+          "path": "public/index.php",
+          "line": 20
+        }
+      ]
+    },
+    {
+      "title": "Loss of backups and alerting at cut-over",
+      "severity": "medium",
+      "description": "The only backup is a weekly dump that overwrites a single file, and cron errors go to the ops mailbox via MAILTO. Neither carries over to the new platform.",
+      "mitigation": "Enable Postgres PITR and run a restore test in P0. Set up Workers Logs alerts before P3.",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 2
+        },
+        {
+          "path": "ops/crontab.txt",
+          "line": 4
+        }
+      ]
+    },
+    {
+      "title": "Workers is not a full Node 22 runtime",
+      "severity": "low",
+      "description": "The target says Node 22, but Workers offers only a nodejs_compat subset. There is no SoapClient, no local filesystem, and TCP is limited to connect().",
+      "mitigation": "Avoid Node-only libraries, hand-build the SOAP envelope, use R2 for files, and test in workerd/Miniflare.",
+      "evidence": [
+        {
+          "path": "includes/PaymentGateway.php",
+          "line": 8
+        },
+        {
+          "path": "includes/config.php",
+          "line": 17
+        }
+      ]
+    }
+  ],
+  "openQuestions": [
+    {
+      "question": "Which system or person creates invoices, customers and users, and how? (No code in this repo does.)",
+      "whyItMatters": "It must be pointed at Postgres at cut-over, or new data is lost. This is a go/no-go gate.",
+      "askWho": "Finance/accounting ops and the DBA for db01",
+      "evidence": [
+        {
+          "path": "sql/schema.sql",
+          "line": 14
+        }
+      ]
+    },
+    {
+      "question": "Is the nightly compounding late fee intended, or should the fee be applied once per invoice or once per period?",
+      "whyItMatters": "It determines whether the new job copies the current behaviour or fixes it, and changes customer balances.",
+      "askWho": "Finance / billing owner",
+      "evidence": [
+        {
+          "path": "cron/send_overdue_reminders.php",
+          "line": 10
+        },
+        {
+          "path": "includes/db.php",
+          "line": 24
+        }
+      ]
+    },
+    {
+      "question": "How does the ERP reach the app (hostname or IP), can it send an auth token or header, which egress IP does it use toward the internet, and what since values does it send?",
+      "whyItMatters": "This decides the access-control method for the Worker, whether a DNS switch is enough, and which contract tests are needed.",
+      "askWho": "Accounting/ERP team",
+      "evidence": [
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 2
+        },
+        {
+          "path": "public/api/invoice_status.php",
+          "line": 7
+        }
+      ]
+    },
+    {
+      "question": "Will the ERP accept invoices starting to appear with status 'paid' once updated_at is set on charge? Should historical paid invoices be backfilled?",
+      "whyItMatters": "Fixing the bug changes what the ERP receives and may duplicate or alter its records.",
+      "askWho": "Accounting/ERP team",
+      "evidence": [
+        {
+          "path": "public/api/charge.php",
+          "line": 13
+        }
+      ]
+    },
+    {
+      "question": "Are there other consumers of /status.json or the app (scripts or reports from the office subnet, bookmarks to /invoices)?",
+      "whyItMatters": "Every machine on the /24 can reach the feed today, and those callers would break silently.",
+      "askWho": "Network/security team (access logs)",
+      "evidence": [
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 3
+        },
+        {
+          "path": "public/.htaccess",
+          "line": 2
+        }
+      ]
+    },
+    {
+      "question": "Does PayGate allowlist source IPs, support two active API keys, and de-duplicate charges on Reference?",
+      "whyItMatters": "Workers egress IPs differ from app01's. Key rotation without downtime and double-charge protection both depend on the answers.",
+      "askWho": "PayGate account manager",
+      "evidence": [
+        {
+          "path": "includes/PaymentGateway.php",
+          "line": 15
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 6
+        }
+      ]
+    },
+    {
+      "question": "Which SMTP port and TLS settings actually work in production, and are SPF/DKIM set up for billing@acme.example?",
+      "whyItMatters": "The code sets no port, but the firewall allows only 587, and mail deliverability from the new path depends on DNS auth records.",
+      "askWho": "Mail/infra team",
+      "evidence": [
+        {
+          "path": "includes/Mailer.php",
+          "line": 8
+        },
+        {
+          "path": "ops/firewall-notes.txt",
+          "line": 7
+        }
+      ]
+    },
+    {
+      "question": "What generates the invoice PDFs in storage/pdf?",
+      "whyItMatters": "That generator must write to R2 after cut-over, or reminders go out without attachments.",
+      "askWho": "App owner / ops",
+      "evidence": [
+        {
+          "path": "includes/config.php",
+          "line": 17
+        },
+        {
+          "path": "composer.json",
+          "line": 8
+        }
+      ]
+    },
+    {
+      "question": "What are the data volumes (row counts, PDF count and size, number of overdue invoices per night) and app01's time zone?",
+      "whyItMatters": "Volumes size the cut-over window and the Worker/Queue design. The time zone affects the fee date and timestamp conversion.",
+      "askWho": "DBA / ops",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 3
+        },
+        {
+          "path": "sql/schema.sql",
+          "line": 21
+        }
+      ]
+    },
+    {
+      "question": "Is db01 shared with other applications? Is the 2015 tax migration applied, and is tax_cents/tax_rates used by anything outside this repo?",
+      "whyItMatters": "This decides whether db01 can be shut down and whether the tax data must keep its meaning.",
+      "askWho": "DBA",
+      "evidence": [
+        {
+          "path": "sql/migrations/2015_add_tax.sql",
+          "line": 1
+        },
+        {
+          "path": "includes/config.php",
+          "line": 3
+        }
+      ]
+    },
+    {
+      "question": "What retention period does finance require for the archived invoice and payment data?",
+      "whyItMatters": "It sets how long the final archive is kept after decommission.",
+      "askWho": "Finance / compliance",
+      "evidence": [
+        {
+          "path": "ops/crontab.txt",
+          "line": 4
+        }
+      ]
+    }
+  ],
+  "reviewNotes": [
+    {
+      "finding": "The P2 comparison relied on overdue.log, but the cron script prints nothing, so the log has no fee data.",
+      "resolution": "P0 now adds fee logging to the PHP job. P2 compares the dry-run fees with that log and with before/after snapshots of total_cents around 02:15."
+    },
+    {
+      "finding": "The P0 rollback said 'nothing changed in prod', but rotating credentials changes app01.",
+      "resolution": "P0 now creates new credentials alongside the old ones without touching app01. Rotating the old ones moves to decommission. The P0 rollback reverts the logging change and revokes the new credentials. A question about PayGate dual keys was added."
+    },
+    {
+      "finding": "A unique constraint on payments needs a status column, and existing duplicate payments would break the load.",
+      "resolution": "Data step 2 adds nullable status and idempotency_key columns, with a unique index only on idempotency_key. Data step 1 profiles duplicate payments."
+    },
+    {
+      "finding": "Invoice numbers are not unique, so keying PDFs by number is unsafe.",
+      "resolution": "R2 keys now use the invoice id, with the number kept as metadata. Ambiguous or unmapped files are reported. Duplicate numbers are profiled in step 1."
+    },
+    {
+      "finding": "The fee ledger did not cover the cut-over day, and the cron and Cron Trigger time zones differ.",
+      "resolution": "Data step 6 seeds late_fee_runs with the last old run date. business_date is defined in the server time zone. A time-zone risk and an open question were added."
+    },
+    {
+      "finding": "The P3 rollback could re-enable the crontab on the same day the new job ran.",
+      "resolution": "The P3 rollback order is now: reminder off, reverse sync, DNS back, crontab only from the next business day."
+    },
+    {
+      "finding": "The P4 read-only lock blocks the reverse-sync rollback.",
+      "resolution": "The P4 rollback now lifts read_only and restores grants first. The reverse sync is rehearsed in P1."
+    },
+    {
+      "finding": "The unknown writer breaks cut-over and rollback and was rated only medium.",
+      "resolution": "Raised to critical, made a go/no-go gate in P0/P3, added as an inbound integration, and added to the P3 rollback steps."
+    },
+    {
+      "finding": "Charge can bill a card with no local record (uncaught SOAP exceptions, DB errors only logged, ok:true always returned).",
+      "resolution": "Added as a high risk. P1 now has a pending row written before the gateway call, non-2xx on failure, reconciliation by Reference, and unchanged invoice ids."
+    },
+    {
+      "finding": "PHP sessions are stored as files on app01.",
+      "resolution": "Covered in the staff integration action and the sessions risk. Staff are told to expect a forced re-login."
+    },
+    {
+      "finding": "'latin1' is really cp1252, data may be double-encoded, and json_encode fails on non-UTF-8.",
+      "resolution": "Steps 1 and 3 now convert as Windows-1252 and detect double encoding. A character-set risk was added."
+    },
+    {
+      "finding": "NULL updated_at rows and empty since values in the feed were not handled.",
+      "resolution": "Added to the P1 contract tests, step 6 verification, the ERP risk, and an open question on backfill."
+    },
+    {
+      "finding": "The reminder job may hit Worker CPU and subrequest limits.",
+      "resolution": "Redesigned as a Cron Trigger feeding a Queue, one message per invoice, with the fee and email recorded separately. A load check was added to the P2 exit criteria."
+    },
+    {
+      "finding": "Alerting through cron MAILTO is lost.",
+      "resolution": "Added as an integration. Workers Logs alerting is a P0 exit criterion."
+    },
+    {
+      "finding": "No Postgres backups were set up before mysqldump is decommissioned.",
+      "resolution": "PITR plus a restore test is now in P0, with a risk for backup and alerting loss."
+    },
+    {
+      "finding": "Credentials are committed to the repo. The reviewer read the config.php:2 comment as claiming the file was never committed.",
+      "resolution": "Partially accepted. The comment at config.php:2 says the values are 'never committed to a secrets store', not that the file is absent from git. Either way the file is in the repo, so the credentials are treated as exposed: high risk, secret scanning, and rotation in the decommission checklist."
+    },
+    {
+      "finding": "Rehearsal mysqldump --lock-tables blocks production.",
+      "resolution": "Step 3 now exports from a snapshot or replica, or otherwise runs outside business hours and away from 02:15 and the Sunday 03:00 run. A matching risk was added."
+    }
+  ]
+}

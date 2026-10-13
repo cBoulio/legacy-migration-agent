@@ -1,0 +1,10 @@
+{
+    "name": "acme-fictional/invoicing",
+    "description": "Internal invoicing tool (fictional example for legacy-migration-agent)",
+    "require": {
+        "php": ">=5.4",
+        "phpmailer/phpmailer": "5.2.9",
+        "econea/nusoap": "0.9.6",
+        "tecnickcom/tcpdf": "6.2.12"
+    }
+}

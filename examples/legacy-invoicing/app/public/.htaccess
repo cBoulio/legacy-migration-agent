@@ -1,0 +1,3 @@
+RewriteEngine On
+RewriteRule ^invoices/?$ index.php [L]
+RewriteRule ^status\.json$ api/invoice_status.php [L]

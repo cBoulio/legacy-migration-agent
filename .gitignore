@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+
+# Run output. Committed samples live in examples/*/ under explicit names.
+report/
+examples/*/live-run/
+
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
