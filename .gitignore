@@ -3,7 +3,7 @@ dist/
 coverage/
 
 # Run output. Committed samples live in examples/*/ under explicit names.
-report/
+/report/
 examples/*/live-run/
 
 .env
